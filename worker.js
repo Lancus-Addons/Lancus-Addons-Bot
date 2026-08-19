@@ -212,9 +212,60 @@ function parseUserId(raw) {
 }
 
 /** Commands that change the list, and so need edit rights. */
-const EDIT_COMMANDS  = new Set(['shitteradd', 'shitterremove']);
+const EDIT_COMMANDS  = new Set(['shitteradd', 'shitterremove', 'shittertoken']);
 /** Commands that change who may edit, and so are the owner's alone. */
 const OWNER_COMMANDS = new Set(['shitterallow', 'shitterdeny', 'shittereditors']);
+
+// ── Tokens, for editing from inside the game ────────────────────────────────
+
+/**
+ * Edits from the mod are authorised by a token, not by a Minecraft name.
+ *
+ * A name cannot be the gate. The mod is public and anyone can send the Worker an
+ * ordinary HTTP request, so "only let MrLancus edit" enforced on a name in the body
+ * means only letting people who cannot be bothered to type a different name edit. The
+ * check has to be something the caller has to hold, not something they can claim.
+ *
+ * So each editor gets a token from Discord with /shittertoken, pastes it into the
+ * mod's config, and the mod sends it as a bearer token. The token is bound to the
+ * Discord account that asked for it, which means the existing editor list stays the
+ * one place trust is granted: revoke someone with /shitterdeny and their token stops
+ * working, because it is checked against that list on every use.
+ *
+ * The Minecraft name still travels with an edit, but as the reporter on the entry
+ * rather than as the permission. It is a record of who did it, not a claim to be let
+ * in.
+ */
+const tokenKey  = (token) => `token:${token}`;
+const tokenForKey = (discordId) => `tokenfor:${discordId}`;
+
+async function issueToken(env, discordId) {
+  const existing = await env.SHITTER_LIST.get(tokenForKey(discordId));
+  if (existing) return existing;
+
+  const bytes = crypto.getRandomValues(new Uint8Array(24));
+  const token = [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+  await env.SHITTER_LIST.put(tokenKey(token), discordId);
+  await env.SHITTER_LIST.put(tokenForKey(discordId), token);
+  return token;
+}
+
+/**
+ * The Discord account behind a bearer token, if it is still allowed to edit.
+ *
+ * Rights are re-checked here rather than trusted from when the token was issued, so
+ * removing an editor takes effect immediately instead of leaving a working key behind.
+ */
+async function tokenHolder(env, request) {
+  const header = request.headers.get('authorization') || '';
+  const token  = header.replace(/^Bearer\s+/i, '').trim();
+  if (!token) return null;
+
+  const discordId = await env.SHITTER_LIST.get(tokenKey(token));
+  if (!discordId) return null;
+  if (discordId === ownerId(env)) return discordId;
+  return (await editorIds(env)).includes(discordId) ? discordId : null;
+}
 
 // ── Commands ────────────────────────────────────────────────────────────────
 
@@ -354,6 +405,15 @@ async function handleEditors(env) {
   };
 }
 
+async function handleToken(env, interaction) {
+  const token = await issueToken(env, actorId(interaction));
+  return {
+    content: 'Your edit token is below. Paste it into the mod\'s config as '
+      + '`shitterToken`. Treat it like a password: anyone holding it can edit the '
+      + 'list as you.\n```\n' + token + '\n```',
+  };
+}
+
 async function handleCount(env) {
   const entries = await allEntries(env);
   return { content: `${entries.length} player${entries.length === 1 ? '' : 's'} on the list.` };
@@ -368,6 +428,7 @@ async function dispatch(env, interaction) {
     case 'shitterallow':  return handleAllow(env, interaction);
     case 'shitterdeny':   return handleDeny(env, interaction);
     case 'shittereditors': return handleEditors(env);
+    case 'shittertoken': return handleToken(env, interaction);
     default:              return { content: 'Unknown command.' };
   }
 }
@@ -421,6 +482,7 @@ const COMMAND_DEFINITIONS = (() => {
       options: [text('user', 'Their Discord user id, or an @mention')],
     },
     { name: 'shittereditors', description: 'Who can edit the list (owner only)' },
+    { name: 'shittertoken', description: 'Get your token for editing from inside the game' },
   ];
 })();
 
@@ -484,6 +546,82 @@ export default {
       return new Response(JSON.stringify({ success: true, entries }), { headers: JSON_HEADERS });
     }
 
+    // ── Edits from the mod ──────────────────────────────────────────────
+    // Separate from the Discord routes because they carry a bearer token instead of
+    // an interaction signature, and answer plain JSON rather than a Discord payload.
+    if (request.method === 'POST' && (url.pathname === '/add' || url.pathname === '/remove')) {
+      const discordId = await tokenHolder(env, request);
+      if (!discordId) {
+        return new Response(JSON.stringify({
+          success: false,
+          error: 'You do not have permission to edit the shitter list.',
+        }), { status: 403, headers: JSON_HEADERS });
+      }
+
+      let payload;
+      try {
+        payload = await request.json();
+      } catch (e) {
+        return new Response(JSON.stringify({ success: false, error: 'Bad request body.' }),
+          { status: 400, headers: JSON_HEADERS });
+      }
+
+      const typed = String(payload.username || '').trim();
+      if (!typed) {
+        return new Response(JSON.stringify({ success: false, error: 'No username given.' }),
+          { status: 400, headers: JSON_HEADERS });
+      }
+
+      const profile = await resolveName(typed);
+      if (profile === null) {
+        return new Response(JSON.stringify({
+          success: false, error: `${typed} is not a Minecraft account.` }),
+          { status: 404, headers: JSON_HEADERS });
+      }
+      if (profile === undefined) {
+        return new Response(JSON.stringify({
+          success: false, error: 'Could not reach Mojang to check that name.' }),
+          { status: 503, headers: JSON_HEADERS });
+      }
+
+      if (url.pathname === '/remove') {
+        const had = await getEntry(env, profile.uuid);
+        if (!had) {
+          return new Response(JSON.stringify({
+            success: false, error: `${profile.name} is not on the list.` }),
+            { status: 404, headers: JSON_HEADERS });
+        }
+        await env.SHITTER_LIST.delete(key(profile.uuid));
+        return new Response(JSON.stringify({ success: true, name: profile.name }),
+          { headers: JSON_HEADERS });
+      }
+
+      const reason = String(payload.reason || '').trim();
+      const area   = String(payload.area   || '').trim();
+      if (!reason || !area) {
+        return new Response(JSON.stringify({
+          success: false, error: 'A reason and an area are both required.' }),
+          { status: 400, headers: JSON_HEADERS });
+      }
+
+      const existing = await getEntry(env, profile.uuid);
+      // The in-game name is recorded as the reporter alongside the Discord account
+      // the token belongs to, so an entry says both who added it and from where.
+      const via = String(payload.by || '').trim();
+      await putEntry(env, {
+        uuid: profile.uuid,
+        name: profile.name,
+        reason,
+        area,
+        addedBy: via ? `${via} (mod, discord ${discordId})` : `mod, discord ${discordId}`,
+        addedAt: existing?.addedAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      return new Response(JSON.stringify({
+        success: true, name: profile.name, updated: Boolean(existing) }),
+        { headers: JSON_HEADERS });
+    }
+
     if (request.method !== 'POST') {
       return new Response('Lancus Addons', { headers: { 'content-type': 'text/plain' } });
     }
@@ -529,7 +667,7 @@ export default {
         type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
         // Who may edit is between the owner and the bot; adding and looking up stay
         // public, so a shared list can be seen to be maintained.
-        data: OWNER_COMMANDS.has(name) ? { flags: 64 } : {},
+        data: (OWNER_COMMANDS.has(name) || name === 'shittertoken') ? { flags: 64 } : {},
       }), { headers: JSON_HEADERS });
     }
 
