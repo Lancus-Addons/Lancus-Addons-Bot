@@ -338,8 +338,23 @@ export default {
     // Registration. Guarded by a secret because it can rewrite the bot's command
     // list, and a URL anyone could hit is not a place to leave that.
     if (url.pathname === '/register') {
-      if (!env.ADMIN_SECRET || url.searchParams.get('secret') !== env.ADMIN_SECRET) {
-        return new Response('nope\n', { status: 401 });
+      // Two different failures, said apart. Which one it is gives nothing away – that
+      // the secret is unset is not a secret – and one flat "no" during setup leaves
+      // you guessing between a missing binding and a typo.
+      if (!env.ADMIN_SECRET) {
+        return new Response(
+          'ADMIN_SECRET is not set on this Worker. Add it under Settings, Variables and Secrets.\n',
+          { status: 401, headers: { 'content-type': 'text/plain' } });
+      }
+      // Trimmed on both sides: pasting into the dashboard picks up a trailing newline
+      // often enough that an invisible character is the likeliest reason a secret that
+      // looks identical does not match.
+      const given = (url.searchParams.get('secret') || request.headers.get('x-admin-secret') || '').trim();
+      if (given !== env.ADMIN_SECRET.trim()) {
+        return new Response(
+          given ? 'That secret does not match the one set on this Worker.\n'
+                : 'No secret given. Add ?secret=... to the URL.\n',
+          { status: 401, headers: { 'content-type': 'text/plain' } });
       }
       return registerCommands(env, url.searchParams.get('guild'));
     }
