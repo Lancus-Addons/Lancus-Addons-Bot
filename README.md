@@ -11,15 +11,41 @@ Found a bug, or want something added? Message **mrlancus** on Discord.
 
 ## Commands
 
-| Command | What it does |
-| --- | --- |
-| `/shitteradd <username> <reason> <area>` | Add a player, or update an entry that already exists |
-| `/shitter <username>` | Look someone up |
-| `/shitterremove <username>` | Take a player off the list |
-| `/shittercount` | How many players are on the list |
+| Command | Who can use it | What it does |
+| --- | --- | --- |
+| `/shitter <username>` | anyone | Look someone up |
+| `/shittercount` | anyone | How many players are on the list |
+| `/shitteradd <username> <reason> <area>` | editors | Add a player, or update an existing entry |
+| `/shitterremove <username>` | editors | Take a player off the list |
+| `/shitterallow <user>` | owner | Let someone edit the list |
+| `/shitterdeny <user>` | owner | Stop someone editing the list |
+| `/shittereditors` | owner | Who can currently edit |
 
-Every field is free text. Reasons and areas of the game do not fit a fixed list of
-choices, and a dropdown would go stale the moment anything new came along.
+The username, reason and area fields are free text. Reasons and areas of the game do
+not fit a fixed set of choices, and a dropdown would go stale the moment anything new
+came along.
+
+## Who can do what
+
+Three levels. **Anyone** can look players up, because a list nobody can read is no
+use. **Editors** can add and remove. The **owner** decides who the editors are.
+
+The owner is set by `OWNER_ID`, defaulting to the id baked into `worker.js`. It is
+the one identity that cannot be granted or revoked through the bot, so there is
+always somebody able to repair the editor list – an editor list that can lock its own
+owner out is one bad command away from needing the dashboard to fix it.
+
+Editors are stored in KV and are global, not per server: the list is one shared thing,
+so trusting somebody trusts them everywhere the bot is.
+
+Rights are checked before the command is acknowledged rather than inside the handler.
+A deferred reply is public and cannot be made private afterwards, so checking later
+would announce every refusal to the channel. A refusal reads:
+
+> You do not have permission to edit the shitter list.
+
+Owner commands and their replies are private. Adding and looking up stay public, so a
+shared list can be seen to be maintained.
 
 ## How entries are stored
 
@@ -86,6 +112,9 @@ Worker, **Settings**, **Variables and Secrets**. Add four, all as **Secret**:
 | `DISCORD_APP_ID` | Application ID from step 1 |
 | `DISCORD_BOT_TOKEN` | Bot token from step 1 |
 | `ADMIN_SECRET` | Any long random string you make up |
+
+`OWNER_ID` can be set here too, as a plain variable, to move ownership without
+touching the code.
 
 ### 6. Point Discord at the Worker
 

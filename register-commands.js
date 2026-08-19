@@ -34,10 +34,7 @@ const commands = [
     description: 'Take a player off the list',
     options: [text('username', 'Their Minecraft name')],
   },
-  {
-    name: 'shittercount',
-    description: 'How many players are on the list',
-  },
+  { name: 'shittercount', description: 'How many players are on the list' },
 ];
 
 const appId = process.env.DISCORD_APP_ID;

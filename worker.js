@@ -154,6 +154,68 @@ async function allEntries(env) {
 /** What the mod is allowed to see. The reporter is deliberately not in here. */
 const publicView = (e) => ({ uuid: e.uuid, name: e.name, reason: e.reason, area: e.area, addedAt: e.addedAt });
 
+// ── Permissions ─────────────────────────────────────────────────────────────
+
+/**
+ * Who may change the list.
+ *
+ * <p>Three levels: the owner, the editors the owner has named, and everyone else.
+ * Everyone else can still look people up – a list nobody can read is no use – but
+ * only editors can put someone on it or take them off.</p>
+ *
+ * The owner is the one identity that cannot be granted or revoked through the bot,
+ * so there is always someone able to repair the editor list. It is baked in rather
+ * than stored, because an editor list that can lock its own owner out is one bad
+ * command away from needing the dashboard to fix.
+ */
+const ownerId = (env) => String(env.OWNER_ID || '728271613195190294').trim();
+
+const EDITORS_KEY = 'editors';
+
+async function editorIds(env) {
+  const raw = await env.SHITTER_LIST.get(EDITORS_KEY);
+  try {
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+async function setEditorIds(env, ids) {
+  await env.SHITTER_LIST.put(EDITORS_KEY, JSON.stringify([...new Set(ids)]));
+}
+
+/** Whoever ran the command. Guild commands nest the user; DMs do not. */
+const actorId = (interaction) =>
+  interaction.member?.user?.id || interaction.user?.id || null;
+
+const isOwner = (env, interaction) => actorId(interaction) === ownerId(env);
+
+async function canEdit(env, interaction) {
+  const id = actorId(interaction);
+  if (!id) return false;
+  if (id === ownerId(env)) return true;
+  return (await editorIds(env)).includes(id);
+}
+
+/**
+ * A Discord user id out of whatever was typed.
+ *
+ * Accepts a raw id or a mention. A mention is what you get from autocomplete, and a
+ * raw id is the only way to name somebody who is not in the server you are typing
+ * in, so both have to work.
+ */
+function parseUserId(raw) {
+  const id = String(raw || '').replace(/[<@!>\s]/g, '');
+  return /^\d{15,25}$/.test(id) ? id : null;
+}
+
+/** Commands that change the list, and so need edit rights. */
+const EDIT_COMMANDS  = new Set(['shitteradd', 'shitterremove']);
+/** Commands that change who may edit, and so are the owner's alone. */
+const OWNER_COMMANDS = new Set(['shitterallow', 'shitterdeny', 'shittereditors']);
+
 // ── Commands ────────────────────────────────────────────────────────────────
 
 const optionValue = (data, name) => {
@@ -259,6 +321,39 @@ async function handleRemove(env, interaction) {
   return { content: `Removed **${profile?.name || typed}** from the list.` };
 }
 
+async function handleAllow(env, interaction) {
+  const id = parseUserId(optionValue(interaction.data, 'user'));
+  if (!id) return { content: 'That is not a Discord user id. Paste the id, or @mention them.' };
+  if (id === ownerId(env)) return { content: 'You already own the list.' };
+
+  const ids = await editorIds(env);
+  if (ids.includes(id)) return { content: `<@${id}> can already edit the list.` };
+  ids.push(id);
+  await setEditorIds(env, ids);
+  return { content: `<@${id}> can now edit the list.`, allowed_mentions: { parse: [] } };
+}
+
+async function handleDeny(env, interaction) {
+  const id = parseUserId(optionValue(interaction.data, 'user'));
+  if (!id) return { content: 'That is not a Discord user id. Paste the id, or @mention them.' };
+
+  const ids = await editorIds(env);
+  if (!ids.includes(id)) return { content: `<@${id}> was not an editor.`, allowed_mentions: { parse: [] } };
+  await setEditorIds(env, ids.filter((e) => e !== id));
+  return { content: `<@${id}> can no longer edit the list.`, allowed_mentions: { parse: [] } };
+}
+
+async function handleEditors(env) {
+  const ids = await editorIds(env);
+  const lines = ids.map((id) => `<@${id}>  (${id})`);
+  return {
+    content: lines.length
+      ? `Owner: <@${ownerId(env)}>\nEditors:\n${lines.join('\n')}`
+      : `Owner: <@${ownerId(env)}>\nNo other editors yet.`,
+    allowed_mentions: { parse: [] },
+  };
+}
+
 async function handleCount(env) {
   const entries = await allEntries(env);
   return { content: `${entries.length} player${entries.length === 1 ? '' : 's'} on the list.` };
@@ -270,6 +365,9 @@ async function dispatch(env, interaction) {
     case 'shitter':       return handleLookup(env, interaction);
     case 'shitterremove': return handleRemove(env, interaction);
     case 'shittercount':  return handleCount(env);
+    case 'shitterallow':  return handleAllow(env, interaction);
+    case 'shitterdeny':   return handleDeny(env, interaction);
+    case 'shittereditors': return handleEditors(env);
     default:              return { content: 'Unknown command.' };
   }
 }
@@ -312,6 +410,17 @@ const COMMAND_DEFINITIONS = (() => {
       options: [text('username', 'Their Minecraft name')],
     },
     { name: 'shittercount', description: 'How many players are on the list' },
+    {
+      name: 'shitterallow',
+      description: 'Let someone edit the list (owner only)',
+      options: [text('user', 'Their Discord user id, or an @mention')],
+    },
+    {
+      name: 'shitterdeny',
+      description: 'Stop someone editing the list (owner only)',
+      options: [text('user', 'Their Discord user id, or an @mention')],
+    },
+    { name: 'shittereditors', description: 'Who can edit the list (owner only)' },
   ];
 })();
 
@@ -390,6 +499,23 @@ export default {
     }
 
     if (interaction.type === InteractionType.APPLICATION_COMMAND) {
+      const name = interaction.data?.name;
+
+      // Rights are checked before deferring, not inside the handler. A deferred reply
+      // is public and cannot be made private afterwards, so checking later would
+      // announce every refusal to the channel. This costs one KV read, which is far
+      // inside Discord's three second window.
+      if (OWNER_COMMANDS.has(name) && !isOwner(env, interaction)) {
+        return new Response(JSON.stringify(
+          ephemeral('Only the list owner can change who may edit the shitter list.')),
+          { headers: JSON_HEADERS });
+      }
+      if (EDIT_COMMANDS.has(name) && !(await canEdit(env, interaction))) {
+        return new Response(JSON.stringify(
+          ephemeral('You do not have permission to edit the shitter list.')),
+          { headers: JSON_HEADERS });
+      }
+
       // Defer, then edit. Mojang can take longer than Discord's three second limit,
       // and a timed-out interaction cannot be answered at all afterwards.
       ctx.waitUntil((async () => {
@@ -401,6 +527,9 @@ export default {
       })());
       return new Response(JSON.stringify({
         type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE,
+        // Who may edit is between the owner and the bot; adding and looking up stay
+        // public, so a shared list can be seen to be maintained.
+        data: OWNER_COMMANDS.has(name) ? { flags: 64 } : {},
       }), { headers: JSON_HEADERS });
     }
 
