@@ -15,15 +15,22 @@ Found a bug, or want something added? Message **mrlancus** on Discord.
 | --- | --- | --- |
 | `/shitter <username>` | anyone | Look someone up |
 | `/shittercount` | anyone | How many players are on the list |
-| `/shitteradd <username> <reason> <area>` | editors | Add a player, or update an existing entry |
+| `/shitteradd <username> <reason> <gamemode>` | editors | Add a player, or update an existing entry |
 | `/shitterremove <username>` | editors | Take a player off the list |
 | `/shitterallow <user>` | owner | Let someone edit the list |
 | `/shitterdeny <user>` | owner | Stop someone editing the list |
 | `/shittereditors` | owner | Who can currently edit |
+| `/shittertoken` | editors | Your token for editing from inside the game |
+| `/shitterlogchannel [channel]` | owner | Post every change to a channel, or `off` |
 
-The username, reason and area fields are free text. Reasons and areas of the game do
-not fit a fixed set of choices, and a dropdown would go stale the moment anything new
-came along.
+The username, reason and gamemode fields are free text. Reasons and gamemodes do not
+fit a fixed set of choices, and a dropdown would go stale the moment anything new came
+along.
+
+`/shitterlogchannel` needs **View Channel** and **Send Messages** in the channel you
+pick. It posts a test message when you set it, so a missing permission shows up then
+rather than silently swallowing every later entry. Changes made from inside the game
+are logged too, so the channel is a complete record.
 
 ## Who can do what
 
@@ -53,12 +60,18 @@ Entries are keyed by **UUID**, never by name. A name is what people type and wha
 gets displayed, but it is also the one part of an account that can change, and
 keying on it would drop someone off the list the day they renamed themselves.
 
-`/shitteradd` resolves the name through Mojang and stores the capitalisation Mojang
-holds, so the list reads properly and two spellings of one player cannot become two
-entries. Lookups try UUID first and fall back to a name match, so the command still
-works while Mojang is unreachable.
+`/shitteradd` resolves the name and stores the real capitalisation, so the list reads
+properly and two spellings of one player cannot become two entries. Lookups try UUID
+first and fall back to a name match, so the command still works while the name
+services are unreachable.
 
-Each entry holds the UUID, name, reason, area, who added it, and when. **The
+Four name services are tried in turn: Mojang's two endpoints, then playerdb, then
+ashcon. Mojang works fine from an ordinary machine and is unreliable from a Worker,
+because Cloudflare's egress addresses are shared across the whole platform and get
+rate-limited far harder than a home connection. The first definite answer wins,
+whether that is a profile or a confirmed miss.
+
+Each entry holds the UUID, name, reason, gamemode, who added it, and when. **The
 reporter is never sent to the mod** – it is there so an entry can be traced back to
 whoever added it.
 

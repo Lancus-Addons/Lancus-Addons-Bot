@@ -89,38 +89,99 @@ async function followUp(env, token, payload) {
 /**
  * Resolve a typed name to a real account.
  *
- * Returns the capitalisation Mojang holds rather than whatever was typed, so the
- * list reads properly and two spellings of one player cannot become two entries.
+ * <p>Returns the capitalisation the account really has rather than whatever was
+ * typed, so the list reads properly and two spellings of one player cannot become two
+ * entries.</p>
+ *
+ * <h2>Why four providers</h2>
+ *
+ * <p>Mojang's own endpoints work fine from an ordinary machine and are unreliable from
+ * a Worker: Cloudflare's egress addresses are shared by everyone on the platform, so
+ * Mojang rate-limits them far harder than a home connection. Trying only Mojang meant
+ * a name that resolves instantly from a laptop reported "could not reach Mojang" in
+ * production, which is exactly what happened.</p>
+ *
+ * <p>So the lookup falls through several services that all answer the same question.
+ * The first definite answer wins, whether that is a profile or a confirmed miss.</p>
+ *
+ * @returns {{uuid: string, name: string}} on success, {@code null} when the name is
+ *          definitely not an account, {@code undefined} when nothing could be reached
  */
 async function resolveName(name) {
-  const endpoints = [
-    `https://api.minecraftservices.com/minecraft/profile/lookup/name/${encodeURIComponent(name)}`,
-    `https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(name)}`,
+  const encoded = encodeURIComponent(name);
+  const headers = { 'User-Agent': 'LancusAddons (Discord bot)', accept: 'application/json' };
+
+  // Each reads one service's answer into the common shape, or returns undefined to
+  // mean "this one could not tell us".
+  const providers = [
+    {
+      url: `https://api.mojang.com/users/profiles/minecraft/${encoded}`,
+      // A 204 or 404 here is Mojang saying the name is free.
+      read: (res, body) => (res.status === 204 || res.status === 404) ? null
+        : (body?.id && body?.name ? { uuid: body.id, name: body.name } : undefined),
+    },
+    {
+      url: `https://api.minecraftservices.com/minecraft/profile/lookup/name/${encoded}`,
+      read: (res, body) => res.status === 404 ? null
+        : (body?.id && body?.name ? { uuid: body.id, name: body.name } : undefined),
+    },
+    {
+      url: `https://playerdb.co/api/player/minecraft/${encoded}`,
+      // playerdb reports a miss as 400 with a code, not as a 404.
+      read: (res, body) => body?.code === 'minecraft.invalid_username' ? null
+        : (body?.data?.player?.id && body?.data?.player?.username
+            ? { uuid: body.data.player.id, name: body.data.player.username } : undefined),
+    },
+    {
+      url: `https://api.ashcon.app/mojang/v2/user/${encoded}`,
+      read: (res, body) => res.status === 404 ? null
+        : (body?.uuid && body?.username ? { uuid: body.uuid, name: body.username } : undefined),
+    },
   ];
-  for (const url of endpoints) {
+
+  const tried = [];
+  for (const provider of providers) {
     try {
-      const res = await fetch(url);
-      if (res.status === 404) return null;      // a real answer: no such player
-      if (!res.ok) continue;                     // rate limited or down: try the next
-      const body = await res.json();
-      if (body && body.id && body.name) return { uuid: body.id.replace(/-/g, ''), name: body.name };
+      const res = await fetch(provider.url, { headers });
+      let body = null;
+      try { body = await res.json(); } catch (e) { /* empty or not JSON, e.g. a 204 */ }
+      const answer = provider.read(res, body);
+      if (answer === null) return null;                        // definitely no such player
+      if (answer) return { uuid: answer.uuid.replace(/-/g, ''), name: answer.name };
+      tried.push(`${new URL(provider.url).hostname}:${res.status}`);
     } catch (e) {
-      // Fall through to the next endpoint.
+      tried.push(`${new URL(provider.url).hostname}:${e.name}`);
     }
   }
-  return undefined;                              // could not tell, as against "not found"
+  // Recorded so a failure says which services refused, rather than just "could not
+  // reach Mojang" for every possible cause.
+  lastLookupFailure = tried.join(', ');
+  return undefined;
 }
+
+/** Why the most recent lookup failed, for the error message. */
+let lastLookupFailure = '';
 
 /** The name a UUID currently answers to, or null when it cannot be checked. */
 async function currentName(uuid) {
-  try {
-    const res = await fetch(`https://sessionserver.mojang.com/session/minecraft/profile/${uuid}`);
-    if (!res.ok) return null;
-    const body = await res.json();
-    return body && body.name ? body.name : null;
-  } catch (e) {
-    return null;
+  const headers = { 'User-Agent': 'LancusAddons (Discord bot)', accept: 'application/json' };
+  const urls = [
+    `https://sessionserver.mojang.com/session/minecraft/profile/${uuid}`,
+    `https://playerdb.co/api/player/minecraft/${uuid}`,
+    `https://api.ashcon.app/mojang/v2/user/${uuid}`,
+  ];
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, { headers });
+      if (!res.ok) continue;
+      const body = await res.json();
+      const found = body?.name || body?.username || body?.data?.player?.username;
+      if (found) return found;
+    } catch (e) {
+      // Next one.
+    }
   }
+  return null;
 }
 
 // ── Storage ─────────────────────────────────────────────────────────────────
@@ -152,7 +213,7 @@ async function allEntries(env) {
 }
 
 /** What the mod is allowed to see. The reporter is deliberately not in here. */
-const publicView = (e) => ({ uuid: e.uuid, name: e.name, reason: e.reason, area: e.area, addedAt: e.addedAt });
+const publicView = (e) => ({ uuid: e.uuid, name: e.name, reason: e.reason, gamemode: e.gamemode, addedAt: e.addedAt });
 
 // ── Permissions ─────────────────────────────────────────────────────────────
 
@@ -214,7 +275,8 @@ function parseUserId(raw) {
 /** Commands that change the list, and so need edit rights. */
 const EDIT_COMMANDS  = new Set(['shitteradd', 'shitterremove', 'shittertoken']);
 /** Commands that change who may edit, and so are the owner's alone. */
-const OWNER_COMMANDS = new Set(['shitterallow', 'shitterdeny', 'shittereditors']);
+const OWNER_COMMANDS = new Set(['shitterallow', 'shitterdeny', 'shittereditors',
+                                'shitterlogchannel']);
 
 // ── Tokens, for editing from inside the game ────────────────────────────────
 
@@ -278,12 +340,12 @@ async function handleAdd(env, interaction) {
   const data = interaction.data;
   const typed  = optionValue(data, 'username');
   const reason = optionValue(data, 'reason');
-  const area   = optionValue(data, 'area');
+  const gamemode = optionValue(data, 'gamemode');
   const by     = interaction.member?.user || interaction.user || {};
   const addedBy = by.username ? `${by.username} (${by.id})` : String(by.id || 'unknown');
 
-  if (!typed || !reason || !area) {
-    return { content: 'Username, reason and area are all required.' };
+  if (!typed || !reason || !gamemode) {
+    return { content: 'Username, reason and gamemode are all required.' };
   }
 
   const profile = await resolveName(typed);
@@ -291,7 +353,8 @@ async function handleAdd(env, interaction) {
     return { content: `**${typed}** is not a Minecraft account. Check the spelling.` };
   }
   if (profile === undefined) {
-    return { content: 'Could not reach Mojang to check that name. Try again in a moment.' };
+    return { content: 'Could not check that name with any name service. Tried: '
+      + (lastLookupFailure || 'nothing') + '. Try again in a moment.' };
   }
 
   const existing = await getEntry(env, profile.uuid);
@@ -299,12 +362,14 @@ async function handleAdd(env, interaction) {
     uuid: profile.uuid,
     name: profile.name,               // Mojang's capitalisation, not what was typed
     reason,
-    area,
+    gamemode,
     addedBy,
     addedAt: existing?.addedAt || new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
   await putEntry(env, entry);
+  await postToLog(env, logEmbed(`${existing ? 'Updated' : 'Added'}: ${entry.name}`,
+    entry, by.username || 'unknown'));
 
   const verb = existing ? 'Updated' : 'Added';
   return {
@@ -312,8 +377,8 @@ async function handleAdd(env, interaction) {
       title: `${verb}: ${entry.name}`,
       color: 0xff4d4d,
       fields: [
-        { name: 'Reason', value: reason },
-        { name: 'Area',   value: area },
+        { name: 'Reason',   value: reason },
+        { name: 'Gamemode', value: gamemode },
       ],
       footer: { text: `${verb.toLowerCase()} by ${by.username || 'unknown'}` },
     }],
@@ -351,8 +416,8 @@ async function handleLookup(env, interaction) {
       title: heading,
       color: 0xff4d4d,
       fields: [
-        { name: 'Reason', value: entry.reason },
-        { name: 'Area',   value: entry.area },
+        { name: 'Reason',   value: entry.reason },
+        { name: 'Gamemode', value: entry.gamemode },
       ],
       footer: { text: `On the list since ${entry.addedAt.slice(0, 10)}` },
     }],
@@ -368,7 +433,11 @@ async function handleRemove(env, interaction) {
     uuid = (await allEntries(env)).find((e) => e.name.toLowerCase() === wanted)?.uuid;
   }
   if (!uuid) return { content: `**${typed}** is not on the list.` };
+  const removed = await getEntry(env, uuid);
   await env.SHITTER_LIST.delete(key(uuid));
+  const by = interaction.member?.user || interaction.user || {};
+  await postToLog(env, logEmbed(`Removed: ${removed?.name || typed}`,
+    removed || {}, by.username || 'unknown'));
   return { content: `Removed **${profile?.name || typed}** from the list.` };
 }
 
@@ -414,6 +483,75 @@ async function handleToken(env, interaction) {
   };
 }
 
+const LOG_CHANNEL_KEY = 'logchannel';
+
+/**
+ * Announce a change to the log channel, when one is set.
+ *
+ * <p>Every edit goes through here, including edits made from inside the game, so the
+ * channel is a complete record rather than only the things done through Discord.</p>
+ *
+ * <p>Failures are swallowed on purpose. The edit itself has already succeeded, and a
+ * missing permission or a deleted channel must not turn a completed change into an
+ * error the user has to puzzle over.</p>
+ */
+async function postToLog(env, embed) {
+  try {
+    const channel = await env.SHITTER_LIST.get(LOG_CHANNEL_KEY);
+    if (!channel) return;
+    const res = await fetch(`https://discord.com/api/v10/channels/${channel}/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
+      },
+      body: JSON.stringify({ embeds: [embed] }),
+    });
+    if (!res.ok) console.log('log post failed', res.status, await res.text());
+  } catch (e) {
+    console.log('log post threw', e.message);
+  }
+}
+
+const logEmbed = (title, entry, who) => ({
+  title,
+  color: 0xff4d4d,
+  fields: [
+    { name: 'Reason',   value: entry.reason   || 'not given' },
+    { name: 'Gamemode', value: entry.gamemode || 'not given' },
+  ],
+  footer: { text: `by ${who}` },
+  timestamp: new Date().toISOString(),
+});
+
+async function handleLogChannel(env, interaction) {
+  const raw = optionValue(interaction.data, 'channel');
+  if (!raw || raw.toLowerCase() === 'off') {
+    await env.SHITTER_LIST.delete(LOG_CHANNEL_KEY);
+    return { content: 'Log channel turned off.' };
+  }
+  const id = String(raw).replace(/[<#>\s]/g, '');
+  if (!/^\d{15,25}$/.test(id)) {
+    return { content: 'That is not a channel. Pick one, or say `off` to turn logging off.' };
+  }
+  await env.SHITTER_LIST.put(LOG_CHANNEL_KEY, id);
+
+  // Proved rather than promised: post to it now, so a missing permission shows up
+  // here instead of silently swallowing every future entry.
+  const res = await fetch(`https://discord.com/api/v10/channels/${id}/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bot ${env.DISCORD_BOT_TOKEN}` },
+    body: JSON.stringify({ content: 'Shitter list changes will be posted here.' }),
+  });
+  return {
+    content: res.ok
+      ? `Logging changes to <#${id}>.`
+      : `Saved <#${id}>, but I could not post there (${res.status}). `
+        + 'Give me View Channel and Send Messages in it.',
+    allowed_mentions: { parse: [] },
+  };
+}
+
 async function handleCount(env) {
   const entries = await allEntries(env);
   return { content: `${entries.length} player${entries.length === 1 ? '' : 's'} on the list.` };
@@ -429,6 +567,7 @@ async function dispatch(env, interaction) {
     case 'shitterdeny':   return handleDeny(env, interaction);
     case 'shittereditors': return handleEditors(env);
     case 'shittertoken': return handleToken(env, interaction);
+    case 'shitterlogchannel': return handleLogChannel(env, interaction);
     default:              return { content: 'Unknown command.' };
   }
 }
@@ -446,9 +585,8 @@ async function dispatch(env, interaction) {
  * installed, and there is no reason to need a toolchain to send one HTTP request.
  */
 const COMMAND_DEFINITIONS = (() => {
-  // Free text everywhere on purpose: a reason or an area of the game cannot be
-  // pinned to a fixed list without the list going stale, so none of these are
-  // choices.
+  // Free text everywhere on purpose: a reason or a gamemode cannot be pinned to a
+  // fixed list without the list going stale, so none of these are choices.
   const text = (name, description, required = true) => ({ type: 3, name, description, required });
   return [
     {
@@ -457,7 +595,7 @@ const COMMAND_DEFINITIONS = (() => {
       options: [
         text('username', 'Their Minecraft name. Capitalisation is corrected automatically'),
         text('reason',   'What they did'),
-        text('area',     'Which part of the game it happened in'),
+        text('gamemode', 'Which gamemode it happened in'),
       ],
     },
     {
@@ -483,6 +621,12 @@ const COMMAND_DEFINITIONS = (() => {
     },
     { name: 'shittereditors', description: 'Who can edit the list (owner only)' },
     { name: 'shittertoken', description: 'Get your token for editing from inside the game' },
+    {
+      name: 'shitterlogchannel',
+      description: 'Where to post list changes (owner only)',
+      // A channel option gives a picker rather than asking for an id by hand.
+      options: [{ type: 7, name: 'channel', description: 'Channel to log to', required: false }],
+    },
   ];
 })();
 
@@ -580,7 +724,8 @@ export default {
       }
       if (profile === undefined) {
         return new Response(JSON.stringify({
-          success: false, error: 'Could not reach Mojang to check that name.' }),
+          success: false,
+          error: 'Could not check that name right now (' + (lastLookupFailure || 'no detail') + ').' }),
           { status: 503, headers: JSON_HEADERS });
       }
 
@@ -592,15 +737,17 @@ export default {
             { status: 404, headers: JSON_HEADERS });
         }
         await env.SHITTER_LIST.delete(key(profile.uuid));
+        await postToLog(env, logEmbed(`Removed: ${profile.name}`, had,
+          `${String(payload.by || 'someone').trim()} (in game)`));
         return new Response(JSON.stringify({ success: true, name: profile.name }),
           { headers: JSON_HEADERS });
       }
 
-      const reason = String(payload.reason || '').trim();
-      const area   = String(payload.area   || '').trim();
-      if (!reason || !area) {
+      const reason   = String(payload.reason   || '').trim();
+      const gamemode = String(payload.gamemode || '').trim();
+      if (!reason || !gamemode) {
         return new Response(JSON.stringify({
-          success: false, error: 'A reason and an area are both required.' }),
+          success: false, error: 'A reason and a gamemode are both required.' }),
           { status: 400, headers: JSON_HEADERS });
       }
 
@@ -608,15 +755,18 @@ export default {
       // The in-game name is recorded as the reporter alongside the Discord account
       // the token belongs to, so an entry says both who added it and from where.
       const via = String(payload.by || '').trim();
-      await putEntry(env, {
+      const entry = {
         uuid: profile.uuid,
         name: profile.name,
         reason,
-        area,
+        gamemode,
         addedBy: via ? `${via} (mod, discord ${discordId})` : `mod, discord ${discordId}`,
         addedAt: existing?.addedAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-      });
+      };
+      await putEntry(env, entry);
+      await postToLog(env, logEmbed(`${existing ? 'Updated' : 'Added'}: ${entry.name}`,
+        entry, `${via || 'someone'} (in game)`));
       return new Response(JSON.stringify({
         success: true, name: profile.name, updated: Boolean(existing) }),
         { headers: JSON_HEADERS });
