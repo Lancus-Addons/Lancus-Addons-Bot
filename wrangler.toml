@@ -1,0 +1,15 @@
+name = "lancus-addons"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+
+# The list itself. Entries are keyed by UUID, never by name, so an entry survives
+# the player renaming themselves.
+[[kv_namespaces]]
+binding = "SHITTER_LIST"
+id = "8c8dc085eafa4e4bb2e065f6e10197c3"
+
+# Secrets, set with `wrangler secret put <NAME>` rather than kept in this file:
+#   DISCORD_PUBLIC_KEY   verifies that an interaction really came from Discord
+#   DISCORD_APP_ID       used to post the follow-up message
+#   DISCORD_BOT_TOKEN    used to post the follow-up message
+#   ADMIN_SECRET         guards POST /register, which rewrites the bot's commands
