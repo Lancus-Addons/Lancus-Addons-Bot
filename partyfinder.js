@@ -407,6 +407,261 @@ async function top(env, limit, uuid) {
   return { entries, you, total: rows.length };
 }
 
+// -- Player lookups -------------------------------------------------------------
+//
+// All of this exists on the worker rather than in the mod for one reason: the Hypixel key
+// lives here. A key shipped inside a distributed jar is a published key, and the API
+// terms do not allow it. The mod asks for a name and gets an answer.
+
+const MOJANG_TTL_MS  = 24 * 60 * 60 * 1000;
+const PROFILE_TTL_MS = 2 * 60 * 1000;
+
+/** Name to UUID, cached hard because names change rarely and Mojang rate-limits. */
+async function resolveUuid(env, name) {
+  const clean = cleanName(name);
+  if (!clean) return null;
+  const key = 'u:' + clean.toLowerCase();
+  const hit = await env.LEADERBOARD.get(key, 'json');
+  if (hit && Date.now() - hit.at < MOJANG_TTL_MS) return hit;
+
+  const res = await fetch('https://api.mojang.com/users/profiles/minecraft/'
+    + encodeURIComponent(clean));
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => null);
+  if (!data || !data.id) return null;
+  const row = { uuid: data.id, name: data.name, at: Date.now() };
+  await env.LEADERBOARD.put(key, JSON.stringify(row), { expirationTtl: 86400 });
+  return row;
+}
+
+/**
+ * A player's SkyBlock profiles, or a reason there are none.
+ *
+ * The reasons matter and are kept apart. "Never played SkyBlock" and "has the API
+ * switched off" produce the same empty answer if you only look at whether data arrived,
+ * and only one of them is something the person being asked about can change.
+ */
+async function fetchProfiles(env, uuid) {
+  if (!env.HYPIXEL_KEY) return { error: 'no key on the worker' };
+  const res = await fetch(
+    'https://api.hypixel.net/v2/skyblock/profiles?uuid=' + encodeURIComponent(uuid),
+    { headers: { 'API-Key': env.HYPIXEL_KEY } });
+  if (res.status === 429) return { error: 'Hypixel is rate limiting, try again shortly' };
+  if (!res.ok) return { error: 'Hypixel returned ' + res.status };
+  const data = await res.json().catch(() => null);
+  if (!data || !data.success) return { error: 'Hypixel request failed' };
+  if (!Array.isArray(data.profiles) || data.profiles.length === 0) {
+    return { error: 'no SkyBlock profiles' };
+  }
+  return { profiles: data.profiles };
+}
+
+/** The profile they are on now, falling back to the first if none is flagged. */
+function selectedProfile(profiles) {
+  return profiles.find((p) => p.selected) || profiles[0];
+}
+
+const memberOf = (profile, uuid) => {
+  const members = profile.members || {};
+  return members[uuid.replace(/-/g, '')] || members[uuid] || null;
+};
+
+/**
+ * Purse and bank.
+ *
+ * Bank is the one figure behind a SkyBlock API toggle: with Banking switched off the
+ * `banking` object is simply absent, which is indistinguishable from a balance of zero
+ * unless you check for the key rather than the number. That check is the whole reason
+ * this reports `bankApiOff` instead of a cheerful 0.
+ */
+function moneyOf(profile, member) {
+  const purse = Number(member?.currencies?.coin_purse
+    ?? member?.coin_purse ?? NaN);
+  const hasBanking = profile && Object.prototype.hasOwnProperty.call(profile, 'banking');
+  const bank = hasBanking ? Number(profile.banking.balance) || 0 : null;
+  return {
+    purse: Number.isFinite(purse) ? purse : null,
+    purseApiOff: !Number.isFinite(purse),
+    bank,
+    bankApiOff: !hasBanking,
+  };
+}
+
+/** Lifetime dragons, summed across profiles, using the path the probe confirmed. */
+function dragonsOf(profiles, uuid) {
+  let total = 0, found = false;
+  for (const p of profiles) {
+    const m = memberOf(p, uuid);
+    if (!m) continue;
+    const node = dig(m, DRAGON_PATH);
+    if (!node) continue;
+    found = true;
+    total += sumTyped(node.amount_summoned);
+  }
+  return found ? total : null;
+}
+
+/**
+ * Bestiary kills for a named mob.
+ *
+ * The bestiary keys are internal ids rather than display names, and they carry tier and
+ * island prefixes, so a player typing "zealot" has to be matched loosely against them.
+ * Matching is deliberately reported back: `matched` says which key answered, so a wrong
+ * guess is visible in the reply rather than silently becoming the number.
+ */
+function bestiaryOf(profiles, uuid, query) {
+  const want = String(query || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!want) return { error: 'no mob given' };
+
+  const totals = new Map();
+  let sawBestiary = false;
+  for (const p of profiles) {
+    const m = memberOf(p, uuid);
+    const kills = m?.bestiary?.kills;
+    if (!kills || typeof kills !== 'object') continue;
+    sawBestiary = true;
+    for (const [k, v] of Object.entries(kills)) {
+      if (typeof v !== 'number') continue;
+      totals.set(k, (totals.get(k) || 0) + v);
+    }
+  }
+  if (!sawBestiary) return { error: 'bestiary API is off' };
+
+  // Exact key first, then a key containing the query, then the query containing the key.
+  // Ties go to the biggest count, which is the tier the player has actually farmed.
+  let best = null;
+  for (const [k, v] of totals.entries()) {
+    const flat = k.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const score = flat === want ? 3 : flat.includes(want) ? 2 : want.includes(flat) ? 1 : 0;
+    if (score === 0) continue;
+    if (!best || score > best.score || (score === best.score && v > best.kills)) {
+      best = { key: k, kills: v, score };
+    }
+  }
+  if (!best) return { error: 'no mob matching that' };
+
+  // Every tier of the same mob is its own key, so they are added up: somebody asking how
+  // many zealots you have killed does not mean zealots of one particular tier.
+  let sum = 0;
+  const flatWant = best.key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  for (const [k, v] of totals.entries()) {
+    const flat = k.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (flat === flatWant || flat.includes(want)) sum += v;
+  }
+  return { kills: sum, matched: best.key };
+}
+
+async function playerSummary(env, name) {
+  const who = await resolveUuid(env, name);
+  if (!who) return json({ error: 'no such player' }, 404);
+
+  const cacheKey = 'pl:' + who.uuid;
+  const cached = await env.LEADERBOARD.get(cacheKey, 'json');
+  if (cached && Date.now() - cached.at < PROFILE_TTL_MS) return json(cached);
+
+  const got = await fetchProfiles(env, who.uuid);
+  if (got.error) return json({ name: who.name, error: got.error }, 200);
+
+  const profile = selectedProfile(got.profiles);
+  const member = memberOf(profile, who.uuid);
+  const money = moneyOf(profile, member);
+
+  const out = {
+    name: who.name,
+    uuid: who.uuid,
+    profile: profile.cute_name || '',
+    ...money,
+    dragons: dragonsOf(got.profiles, who.uuid),
+    at: Date.now(),
+  };
+  await env.LEADERBOARD.put(cacheKey, JSON.stringify(out), { expirationTtl: 300 });
+  return json(out);
+}
+
+/**
+ * Networth, delegated to a SkyHelper instance.
+ *
+ * Not computed here, and the reason is worth writing down because the obvious guesses are
+ * both wrong. It is not zlib - Buffer, Stream and Zlib are all supported under
+ * `nodejs_compat`, and the library bundles to 172 KiB. It is that networth means parsing
+ * item NBT, prismarine-nbt gets its parser from protodef, and protodef builds that parser
+ * by calling `eval()` at module scope. Workers forbids code generation from strings and
+ * there is no flag to permit it, so this is a platform limit rather than a gap: short of
+ * forking prismarine-nbt onto its interpreted path, the calculation has to run somewhere
+ * that allows eval.
+ *
+ * SKYHELPER_URL points at that somewhere - a hosted instance, or a self-hosted one, or a
+ * Cloudflare Container, which is the only Cloudflare product that can run it.
+ */
+/** One player's museum on one profile, or null when it is unavailable or switched off. */
+async function fetchMuseum(env, profileId, uuid) {
+  if (!env.HYPIXEL_KEY || !profileId) return null;
+  try {
+    const res = await fetch(
+      'https://api.hypixel.net/v2/skyblock/museum?profile=' + encodeURIComponent(profileId),
+      { headers: { 'API-Key': env.HYPIXEL_KEY } });
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    if (!data || !data.success || !data.members) return null;
+    return data.members[uuid.replace(/-/g, '')] || data.members[uuid] || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function networthOf(env, name) {
+  const who = await resolveUuid(env, name);
+  if (!who) return json({ error: 'no such player' }, 404);
+
+  const got = await fetchProfiles(env, who.uuid);
+  if (got.error) return json({ name: who.name, error: got.error }, 200);
+
+  const profile = selectedProfile(got.profiles);
+  const member = memberOf(profile, who.uuid);
+  if (!member) return json({ name: who.name, error: 'no profile data' }, 200);
+
+  // Absent rather than zero when banking is switched off, so a hidden bank is not
+  // quietly counted as an empty one.
+  const bank = profile.banking ? Number(profile.banking.balance) || 0 : 0;
+
+  // The museum counts toward networth and is a separate endpoint. Fetched best-effort:
+  // it is one more subrequest and a player with the museum API off should still get a
+  // figure, just one that omits it.
+  const museum = await fetchMuseum(env, profile.profile_id, who.uuid);
+
+  if (!env.SKYHELPER_URL) {
+    return json({ name: who.name, error: 'networth is not set up on the worker' }, 200);
+  }
+
+  try {
+    const headers = { 'content-type': 'application/json' };
+    if (env.SKYHELPER_TOKEN) headers.Authorization = env.SKYHELPER_TOKEN;
+    const res = await fetch(env.SKYHELPER_URL.replace(/\/$/, '') + '/v2/networth', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ profileData: member, museumData: museum, bankBalance: bank }),
+    });
+    if (!res.ok) {
+      return json({ name: who.name, error: 'networth service returned ' + res.status }, 200);
+    }
+    const data = await res.json().catch(() => null);
+    const total = Number(data?.networth ?? data?.total ?? data?.data?.networth);
+    if (!Number.isFinite(total)) {
+      return json({ name: who.name, error: 'networth service gave no total' }, 200);
+    }
+    return json({
+      name: who.name,
+      networth: Math.round(total),
+      unsoulbound: Math.round(Number(data?.unsoulboundNetworth) || total),
+      profile: profile.cute_name || '',
+      bankHidden: !profile.banking,
+      museumCounted: museum !== null,
+    });
+  } catch (e) {
+    return json({ name: who.name, error: 'networth service unreachable' }, 200);
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -476,9 +731,31 @@ export default {
           playerStatsKeys: m.player_stats ? Object.keys(m.player_stats) : null,
           // Whichever of these is not null is the answer.
           dragonFight: dig(m, DRAGON_PATH) ?? null,
+          currencies: m.currencies ?? null,
+          bankingPresent: Object.prototype.hasOwnProperty.call(p, 'banking'),
+          banking: p.banking ?? null,
+          bestiaryKeys: m.bestiary && m.bestiary.kills
+            ? Object.keys(m.bestiary.kills).slice(0, 40) : null,
         };
       });
       return json({ profiles: out });
+    }
+
+    if (url.pathname === '/player/summary') {
+      return playerSummary(env, url.searchParams.get('name') || '');
+    }
+
+    if (url.pathname === '/player/bestiary') {
+      const who = await resolveUuid(env, url.searchParams.get('name') || '');
+      if (!who) return json({ error: 'no such player' }, 404);
+      const got = await fetchProfiles(env, who.uuid);
+      if (got.error) return json({ name: who.name, error: got.error }, 200);
+      const res = bestiaryOf(got.profiles, who.uuid, url.searchParams.get('mob') || '');
+      return json({ name: who.name, ...res });
+    }
+
+    if (url.pathname === '/player/networth') {
+      return networthOf(env, url.searchParams.get('name') || '');
     }
 
     if (url.pathname === '/lb/top') {

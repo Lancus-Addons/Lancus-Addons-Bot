@@ -1,0 +1,7 @@
+{
+  "name": "lancus-partyfinder",
+  "private": true,
+  "type": "module",
+  "description": "Party finder, dragon leaderboard and player lookups for Lancus Addons.",
+  "comment": "No dependencies. skyhelper-networth cannot run on Workers: prismarine-nbt builds its parser with eval() at module scope, which Workers forbids. See the networthOf comment in partyfinder.js."
+}
