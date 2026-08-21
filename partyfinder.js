@@ -236,29 +236,43 @@ export class PartyRoom {
 const VERIFY_TTL_MS = 10 * 60 * 1000;   // one call per player per ten minutes
 
 /**
- * Candidate paths to the dragon counters on a profile member.
+ * Where the dragon counters live on a profile member.
  *
- * Written as a list, and every one of them tried, because the exact path has not been
- * read off a real payload yet - see /lb/probe. Guessing a single path and shipping it is
- * how you get a leaderboard that silently ranks everyone at zero. When the probe says
- * which one is real, delete the rest.
+ * Read off a real payload via /lb/probe rather than guessed. The three other shapes that
+ * were being tried are gone: they were all null, and a list of candidates is a way of
+ * saying you do not know yet, not something to keep once you do.
  */
-const DRAGON_PATHS = [
-  ['player_stats', 'end_island', 'dragon_fight'],
-  ['player_stats', 'dragon_fight'],
-  ['stats', 'end_island', 'dragon_fight'],
-  ['dragon_fight'],
-];
+const DRAGON_PATH = ['player_stats', 'end_island', 'dragon_fight'];
 
 const dig = (obj, path) => path.reduce((o, k) => (o && typeof o === 'object' ? o[k] : undefined), obj);
 
-/** Sum a leaf that may be a number or a map of per-dragon-type numbers. */
-function total(node) {
+/**
+ * Sum a per-dragon-type map.
+ *
+ * The map carries its own `total` alongside the seven types, and that total is already
+ * their sum - 253 + 253 + 249 + 233 + 232 + 258 + 66 comes to exactly the 1544 it
+ * reports. Adding every value would therefore double the figure, which is precisely the
+ * bug that shipping a guessed parser would have caused: a leaderboard where everybody
+ * has twice the dragons they actually summoned, and nothing to reveal it.
+ *
+ * So `total` wins when present, and the fallback excludes it rather than trusting that
+ * it always is.
+ */
+function sumTyped(node) {
   if (typeof node === 'number') return node;
-  if (node && typeof node === 'object') {
-    return Object.values(node).reduce((a, v) => a + (typeof v === 'number' ? v : 0), 0);
-  }
-  return 0;
+  if (!node || typeof node !== 'object') return 0;
+  if (typeof node.total === 'number') return node.total;
+  return Object.entries(node)
+    .filter(([k, v]) => k !== 'total' && typeof v === 'number')
+    .reduce((a, [, v]) => a + v, 0);
+}
+
+/** The largest value in a per-type map, ignoring the total if one is present. */
+function maxTyped(node) {
+  if (!node || typeof node !== 'object') return 0;
+  return Object.entries(node)
+    .filter(([k, v]) => k !== 'total' && typeof v === 'number')
+    .reduce((a, [, v]) => Math.max(a, v), 0);
 }
 
 /**
@@ -267,8 +281,8 @@ function total(node) {
  * Summed rather than taken from the selected profile: the leaderboard is about what
  * somebody has done, not which save file they happen to be on.
  *
- * Returns null when it cannot tell - no key, a failed call, or a payload whose shape
- * none of DRAGON_PATHS matched. Null means "do not overwrite", never "zero".
+ * Returns null when it cannot tell - no key, a failed call, or a profile with no
+ * dragon_fight node at all. Null means "do not overwrite", never "zero".
  */
 async function verify(env, uuid) {
   if (!env.HYPIXEL_KEY) return null;
@@ -281,21 +295,25 @@ async function verify(env, uuid) {
     if (!data || !data.success || !Array.isArray(data.profiles)) return null;
 
     const bare = uuid.replace(/-/g, '');
-    let summoned = 0, eyes = 0, found = false;
+    let dragons = 0, eyes = 0, superiors = 0, crystals = 0, bestDamage = 0;
+    let found = false;
 
+    // Summed across every profile: the leaderboard is about what somebody has done, not
+    // which save file they are on. Profiles that have never been to the End simply have
+    // no dragon_fight node and contribute nothing.
     for (const profile of data.profiles) {
       const member = (profile.members || {})[bare] || (profile.members || {})[uuid];
       if (!member) continue;
-      for (const path of DRAGON_PATHS) {
-        const node = dig(member, path);
-        if (!node || typeof node !== 'object') continue;
-        found = true;
-        summoned += total(node.amount_summoned);
-        eyes += total(node.summoning_eyes_contributed);
-        break;
-      }
+      const node = dig(member, DRAGON_PATH);
+      if (!node || typeof node !== 'object') continue;
+      found = true;
+      dragons   += sumTyped(node.amount_summoned);
+      eyes      += sumTyped(node.summoning_eyes_contributed);
+      superiors += Number(node.amount_summoned?.superior) || 0;
+      crystals  += Number(node.ender_crystals_destroyed) || 0;
+      bestDamage = Math.max(bestDamage, maxTyped(node.most_damage));
     }
-    return found ? { dragons: summoned, eyes } : null;
+    return found ? { dragons, eyes, superiors, crystals, bestDamage } : null;
   } catch (e) {
     return null;
   }
@@ -314,8 +332,10 @@ async function submit(env, body) {
   // Verified numbers replace the submitted ones outright. They are lifetime figures and
   // the mod's are only since install, so they are not comparable and averaging them
   // would produce a number that is neither.
-  let verified = prev && prev.verified && now - prev.verifiedAt < VERIFY_TTL_MS
-    ? { dragons: prev.dragons, eyes: prev.eyes }
+  const cached = prev && prev.verified && now - prev.verifiedAt < VERIFY_TTL_MS;
+  const verified = cached
+    ? { dragons: prev.dragons, eyes: prev.eyes, superiors: prev.superiors,
+        crystals: prev.crystals, bestDamage: prev.bestDamage }
     : await verify(env, uuid);
 
   if (verified) {
@@ -336,13 +356,20 @@ async function submit(env, body) {
 
   const row = {
     uuid, player, dragons, eyes,
+    // Verified extras, absent when there is no key. Superiors is the one dragon farmers
+    // actually compete on, and it comes free with the call.
+    superiors: verified ? verified.superiors : 0,
+    crystals: verified ? verified.crystals : 0,
+    bestDamage: verified ? Math.round(verified.bestDamage) : 0,
+    // highest_rank in the API is the best placement ever reached, not a count of them,
+    // so first-place finishes stay the mod's own figure. There is nothing to verify it
+    // against and pretending otherwise would be worse than leaving it self-reported.
     firsts: clampInt(body.firsts, 0, 10000000),
     profit: Math.round(Number(body.profit) || 0),
     activeMinutes: clampInt(body.activeMinutes, 0, 10000000),
     // Shown in the mod so a rank is never presented as checked when it was not.
     verified: !!verified,
-    verifiedAt: verified ? (prev && prev.verified && now - prev.verifiedAt < VERIFY_TTL_MS
-      ? prev.verifiedAt : now) : 0,
+    verifiedAt: verified ? (cached ? prev.verifiedAt : now) : 0,
     at: now,
   };
   await env.LEADERBOARD.put('p:' + uuid, JSON.stringify(row));
@@ -366,7 +393,8 @@ async function top(env, limit, uuid) {
 
   const entries = rows.slice(0, limit).map((r, i) => ({
     rank: i + 1, player: r.player, value: r.dragons,
-    eyes: r.eyes, firsts: r.firsts, verified: !!r.verified,
+    eyes: r.eyes, firsts: r.firsts, superiors: r.superiors || 0,
+    verified: !!r.verified,
   }));
 
   let you = null;
@@ -445,9 +473,7 @@ export default {
           memberKeys: Object.keys(m),
           playerStatsKeys: m.player_stats ? Object.keys(m.player_stats) : null,
           // Whichever of these is not null is the answer.
-          candidates: DRAGON_PATHS.map((path) => ({
-            path: path.join('.'), value: dig(m, path) ?? null,
-          })),
+          dragonFight: dig(m, DRAGON_PATH) ?? null,
         };
       });
       return json({ profiles: out });
