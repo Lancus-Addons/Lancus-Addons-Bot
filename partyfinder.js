@@ -222,16 +222,111 @@ export class PartyRoom {
 // properly needs a Hypixel API key here so the profile counters can be read
 // server-side; the stored shape already has room for that.
 
+// -- Verification against Hypixel ----------------------------------------------
+//
+// The submission list IS the player set: Hypixel gives no way to enumerate players, but
+// it does not need to, because everybody who wants ranking announces themselves by
+// submitting. So the API's job here is not to find anyone, it is to check the numbers of
+// the people who turn up. That is what turns a self-reported board into a verified one
+// without the mod changing at all.
+//
+// Without HYPIXEL_KEY set, every function below no-ops and the worker trusts what it was
+// sent, exactly as it does today. Adding the secret is the whole switch.
+
+const VERIFY_TTL_MS = 10 * 60 * 1000;   // one call per player per ten minutes
+
+/**
+ * Candidate paths to the dragon counters on a profile member.
+ *
+ * Written as a list, and every one of them tried, because the exact path has not been
+ * read off a real payload yet - see /lb/probe. Guessing a single path and shipping it is
+ * how you get a leaderboard that silently ranks everyone at zero. When the probe says
+ * which one is real, delete the rest.
+ */
+const DRAGON_PATHS = [
+  ['player_stats', 'end_island', 'dragon_fight'],
+  ['player_stats', 'dragon_fight'],
+  ['stats', 'end_island', 'dragon_fight'],
+  ['dragon_fight'],
+];
+
+const dig = (obj, path) => path.reduce((o, k) => (o && typeof o === 'object' ? o[k] : undefined), obj);
+
+/** Sum a leaf that may be a number or a map of per-dragon-type numbers. */
+function total(node) {
+  if (typeof node === 'number') return node;
+  if (node && typeof node === 'object') {
+    return Object.values(node).reduce((a, v) => a + (typeof v === 'number' ? v : 0), 0);
+  }
+  return 0;
+}
+
+/**
+ * Lifetime dragon numbers for a player, summed across every profile.
+ *
+ * Summed rather than taken from the selected profile: the leaderboard is about what
+ * somebody has done, not which save file they happen to be on.
+ *
+ * Returns null when it cannot tell - no key, a failed call, or a payload whose shape
+ * none of DRAGON_PATHS matched. Null means "do not overwrite", never "zero".
+ */
+async function verify(env, uuid) {
+  if (!env.HYPIXEL_KEY) return null;
+  try {
+    const res = await fetch(
+      'https://api.hypixel.net/v2/skyblock/profiles?uuid=' + encodeURIComponent(uuid),
+      { headers: { 'API-Key': env.HYPIXEL_KEY } });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data || !data.success || !Array.isArray(data.profiles)) return null;
+
+    const bare = uuid.replace(/-/g, '');
+    let summoned = 0, eyes = 0, found = false;
+
+    for (const profile of data.profiles) {
+      const member = (profile.members || {})[bare] || (profile.members || {})[uuid];
+      if (!member) continue;
+      for (const path of DRAGON_PATHS) {
+        const node = dig(member, path);
+        if (!node || typeof node !== 'object') continue;
+        found = true;
+        summoned += total(node.amount_summoned);
+        eyes += total(node.summoning_eyes_contributed);
+        break;
+      }
+    }
+    return found ? { dragons: summoned, eyes } : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function submit(env, body) {
   const uuid = cleanUuid(body.uuid);
   const player = cleanName(body.player);
   if (!uuid || !player) return json({ error: 'bad identity' }, 400);
 
-  const dragons = clampInt(body.dragons, 0, 10000000);
+  let dragons = clampInt(body.dragons, 0, 10000000);
+  let eyes = clampInt(body.eyes, 0, 100000000);
   const now = Date.now();
   const prev = await env.LEADERBOARD.get('p:' + uuid, 'json');
 
-  if (prev) {
+  // Verified numbers replace the submitted ones outright. They are lifetime figures and
+  // the mod's are only since install, so they are not comparable and averaging them
+  // would produce a number that is neither.
+  let verified = prev && prev.verified && now - prev.verifiedAt < VERIFY_TTL_MS
+    ? { dragons: prev.dragons, eyes: prev.eyes }
+    : await verify(env, uuid);
+
+  if (verified) {
+    dragons = verified.dragons;
+    eyes = verified.eyes;
+  }
+
+  // The growth guards only apply to numbers we are trusting. A verified figure needs no
+  // guarding, and a lifetime total arriving for the first time will always look like an
+  // implausible jump next to a since-install one.
+  if (prev && !verified) {
     if (dragons < prev.dragons) return json({ error: 'totals only go up' }, 409);
     const minutes = Math.max(1, (now - prev.at) / 60000);
     if (dragons - prev.dragons > minutes * MAX_DRAGONS_PER_MINUTE) {
@@ -240,11 +335,14 @@ async function submit(env, body) {
   }
 
   const row = {
-    uuid, player, dragons,
-    eyes: clampInt(body.eyes, 0, 100000000),
+    uuid, player, dragons, eyes,
     firsts: clampInt(body.firsts, 0, 10000000),
     profit: Math.round(Number(body.profit) || 0),
     activeMinutes: clampInt(body.activeMinutes, 0, 10000000),
+    // Shown in the mod so a rank is never presented as checked when it was not.
+    verified: !!verified,
+    verifiedAt: verified ? (prev && prev.verified && now - prev.verifiedAt < VERIFY_TTL_MS
+      ? prev.verifiedAt : now) : 0,
     at: now,
   };
   await env.LEADERBOARD.put('p:' + uuid, JSON.stringify(row));
@@ -268,7 +366,7 @@ async function top(env, limit, uuid) {
 
   const entries = rows.slice(0, limit).map((r, i) => ({
     rank: i + 1, player: r.player, value: r.dragons,
-    eyes: r.eyes, firsts: r.firsts,
+    eyes: r.eyes, firsts: r.firsts, verified: !!r.verified,
   }));
 
   let you = null;
@@ -315,6 +413,44 @@ export default {
         }
       }
       return res;
+    }
+
+    // Dumps the shape of one profile so the dragon field paths can be read off a real
+    // payload instead of guessed. The same trick as the mod's `/la lb` probe: when a
+    // format is unknown, ship a way to look at it rather than a guess about it.
+    //
+    //   curl "https://<worker>/lb/probe?uuid=<uuid>&secret=<ADMIN_SECRET>"
+    if (url.pathname === '/lb/probe') {
+      if (!env.ADMIN_SECRET || url.searchParams.get('secret') !== env.ADMIN_SECRET) {
+        return json({ error: 'nope' }, 403);
+      }
+      if (!env.HYPIXEL_KEY) return json({ error: 'HYPIXEL_KEY not set' }, 503);
+      const uuid = cleanUuid(url.searchParams.get('uuid') || '');
+      if (!uuid) return json({ error: 'bad uuid' }, 400);
+
+      const res = await fetch(
+        'https://api.hypixel.net/v2/skyblock/profiles?uuid=' + encodeURIComponent(uuid),
+        { headers: { 'API-Key': env.HYPIXEL_KEY } });
+      const data = await res.json().catch(() => null);
+      if (!data || !Array.isArray(data.profiles)) {
+        return json({ status: res.status, data }, 200);
+      }
+
+      const bare = uuid.replace(/-/g, '');
+      const out = data.profiles.map((p) => {
+        const m = (p.members || {})[bare] || (p.members || {})[uuid] || {};
+        return {
+          profile: p.cute_name,
+          selected: !!p.selected,
+          memberKeys: Object.keys(m),
+          playerStatsKeys: m.player_stats ? Object.keys(m.player_stats) : null,
+          // Whichever of these is not null is the answer.
+          candidates: DRAGON_PATHS.map((path) => ({
+            path: path.join('.'), value: dig(m, path) ?? null,
+          })),
+        };
+      });
+      return json({ profiles: out });
     }
 
     if (url.pathname === '/lb/top') {

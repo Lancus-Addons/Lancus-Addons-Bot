@@ -1,0 +1,41 @@
+# The party finder and dragon leaderboard, deployed separately from the Discord bot.
+#
+# Separate rather than folded into worker.js because it needs a Durable Object and its
+# own migration, and because a bad deploy of one should not take the other down with it.
+# The Discord bot answering slash commands and the party finder holding live party state
+# have nothing in common but an author.
+#
+#   wrangler deploy -c wrangler.partyfinder.toml
+
+name = "lancus-partyfinder"
+main = "partyfinder.js"
+compatibility_date = "2026-01-15"
+
+# The ranked rows, one per player UUID. Create it once with:
+#   wrangler kv namespace create LEADERBOARD
+# then paste the id it prints in below.
+[[kv_namespaces]]
+binding = "LEADERBOARD"
+id = "PASTE_THE_ID_HERE"
+
+# The live party list. One object named "global", so every client sees the same list and
+# two people clicking Join at the same instant cannot both win the last slot.
+[[durable_objects.bindings]]
+name = "PARTIES"
+class_name = "PartyRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PartyRoom"]
+
+# Secrets, set with `wrangler secret put <NAME> -c wrangler.partyfinder.toml` rather than
+# kept in this file:
+#
+#   HYPIXEL_KEY   turns the leaderboard from self-reported into verified. Without it the
+#                 worker keeps working exactly as it does now and simply trusts what the
+#                 mod sends, so it can be added at any point with no redeploy of the mod.
+#                 Must never be shipped inside the mod: a key in a distributed jar is a
+#                 published key, and the API terms do not allow it.
+#
+#   ADMIN_SECRET  guards /lb/probe, which dumps the shape of a profile response so the
+#                 dragon field paths can be read off a real payload rather than guessed.
