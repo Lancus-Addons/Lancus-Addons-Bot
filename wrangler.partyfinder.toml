@@ -16,7 +16,7 @@ compatibility_date = "2026-01-15"
 # then paste the id it prints in below.
 [[kv_namespaces]]
 binding = "LEADERBOARD"
-id = "PASTE_THE_ID_HERE"
+id = "0fa461508b3f4d1f813e9bc641bad3f9"
 
 # The live party list. One object named "global", so every client sees the same list and
 # two people clicking Join at the same instant cannot both win the last slot.
