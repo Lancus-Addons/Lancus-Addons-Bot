@@ -93,9 +93,9 @@ export class PartyRoom {
       case '/pf/list': {
         const parties = Object.values(this.parties).map((p) => ({
           id: p.id, host: p.host, uuid: p.uuid,
-          eyes: p.eyes, dragons: p.dragons, minEyes: p.minEyes,
+          eyes: p.eyes, dragons: p.dragons,
           lobbySwap: p.lobbySwap, note: p.note,
-          size: p.size, maxSize: p.maxSize,
+          size: p.size, maxSize: p.maxSize, members: p.members || [],
           rank: p.rank || 0, dragonsDone: p.dragonsDone || 0,
           updatedAt: p.updatedAt,
         }));
@@ -120,12 +120,12 @@ export class PartyRoom {
         this.parties[id] = {
           id, token, host, uuid,
           eyes: clampInt(body.eyes, 0, 8),
-          minEyes: clampInt(body.minEyes, 0, 8),
           dragons: clampInt(body.dragons, 0, 10000),
           lobbySwap: !!body.lobbySwap,
           note: cleanNote(body.note),
           maxSize: clampInt(body.maxSize, 2, MAX_PARTY),
           size: 1,
+          members: [],
           joins: [],
           rank: 0,
           dragonsDone: 0,
@@ -140,6 +140,11 @@ export class PartyRoom {
         if (!p) return json({ error: 'gone' }, 404);
         if (p.token !== body.token) return json({ error: 'not yours' }, 403);
         p.size = clampInt(body.size, 1, MAX_PARTY);
+        // The roster the host's mod reads off its own chat. Trusted for display only -
+        // the slot arithmetic uses size, which is clamped.
+        p.members = Array.isArray(body.members)
+          ? body.members.map(cleanName).filter(Boolean).slice(0, MAX_PARTY - 1)
+          : [];
         p.updatedAt = Date.now();
 
         // Hand back everyone waiting who has not been told about yet, and mark them
@@ -175,9 +180,6 @@ export class PartyRoom {
         // and five of them get an invite to a party with no room.
         const pending = p.joins.filter((j) => j.state !== 'GONE').length;
         if (p.size + pending >= p.maxSize) return json({ error: 'full' }, 409);
-        if (clampInt(body.eyes, 0, 8) < p.minEyes) {
-          return json({ error: 'not enough eyes' }, 403);
-        }
         if (!p.joins.some((j) => j.player.toLowerCase() === player.toLowerCase())) {
           p.joins.push({ player, uuid: cleanUuid(body.uuid), state: 'WAITING', at: Date.now() });
         }
