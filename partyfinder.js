@@ -1,9 +1,11 @@
 /**
  * Lancus Addons party finder + dragon leaderboard.
  *
- * Deploy as its own Worker, or fold the fetch handler into worker.js. Nothing here is
- * live yet - the mod's `partyFinderUrl` is empty by default precisely so that an
- * undeployed backend reads as absent rather than broken.
+ * Deploy as its own Worker, or fold the fetch handler into worker.js. The mod ships
+ * pointing at this one: `partyFinderUrl` and `leaderboardUrl` default to
+ * lancus-partyfinder.lancus.workers.dev, and a blank value is refilled from the defaults
+ * on load. So a fresh install needs no setup, and a deploy here reaches every player
+ * without a mod update - which cuts both ways, since a bad deploy does too.
  *
  * -- Why a Durable Object -------------------------------------------------------
  * The party list is small, shared and changes every few seconds. KV is eventually
@@ -730,6 +732,50 @@ async function delegatedNetworth(env, member, museum, bank) {
   }
 }
 
+/**
+ * The sack counts on a player's selected profile.
+ *
+ * <p>Polled by the mod every few seconds, so it is cached for five: the underlying
+ * figure only changes when SkyBlock saves the profile, which is far rarer than that, and
+ * one key answering for every user of the mod is the thing worth protecting here.
+ *
+ * `last_save` goes back with it and is the whole reason this is useful. The mod knows
+ * which of its own chat deltas arrived after that moment, so it can take this number as
+ * the truth and re-apply only what the snapshot cannot have included.
+ */
+async function sacksOf(env, name) {
+  const who = await resolveUuid(env, name);
+  if (who.error) return json({ name, error: who.error }, 200);
+
+  const cacheKey = 'sk:' + who.uuid;
+  const cached = await env.LEADERBOARD.get(cacheKey, 'json');
+  if (cached && Date.now() - cached.at < 5000) return json(cached);
+
+  const got = await fetchProfiles(env, who.uuid);
+  if (got.error) return json({ name: who.name || name, error: got.error }, 200);
+
+  const profile = selectedProfile(got.profiles);
+  const member = memberOf(profile, who.uuid);
+  if (!member) return json({ name: who.name || name, error: 'no profile data' }, 200);
+
+  // Two places, because the field moved when Hypixel reorganised the inventory block and
+  // older profiles were not rewritten.
+  const counts = member.sacks_counts || (member.inventory && member.inventory.sacks_counts);
+  if (!counts) {
+    return json({ name: who.name, error: 'sacks are hidden in their API settings' }, 200);
+  }
+
+  const out = {
+    name: who.name || name,
+    profile: profile.cute_name || '',
+    lastSave: Number(member.last_save) || 0,
+    sacks: counts,
+    at: Date.now(),
+  };
+  await env.LEADERBOARD.put(cacheKey, JSON.stringify(out), { expirationTtl: 60 });
+  return json(out);
+}
+
 async function networthOf(env, name) {
   const who = await resolveUuid(env, name);
   if (who.error) return json({ name, error: who.error }, 200);
@@ -856,6 +902,10 @@ export default {
       if (got.error) return json({ name: who.name, error: got.error }, 200);
       const res = bestiaryOf(got.profiles, who.uuid, url.searchParams.get('mob') || '');
       return json({ name: who.name || asked, ...res });
+    }
+
+    if (url.pathname === '/player/sacks') {
+      return sacksOf(env, url.searchParams.get('name') || '');
     }
 
     if (url.pathname === '/player/networth') {
