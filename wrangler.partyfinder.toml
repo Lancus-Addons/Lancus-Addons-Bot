@@ -11,6 +11,28 @@ name = "lancus-partyfinder"
 main = "partyfinder.js"
 compatibility_date = "2026-01-15"
 
+# node:zlib and node:buffer, which is how skyhelper-networth gets at gunzipped item NBT.
+compatibility_flags = ["nodejs_compat"]
+
+# The three modules skyhelper-networth pulls in that a Worker cannot run, each swapped
+# for a small file in shims/ that explains itself. prismarine-nbt is the one that
+# matters: it builds its parser with eval(), which Workers forbid outright, so without
+# this alias the import alone brings the Worker down. See the networth comment in
+# partyfinder.js for the whole chain.
+[alias]
+"prismarine-nbt" = "./shims/prismarine-nbt.js"
+"axios" = "./shims/axios.js"
+"fs" = "./shims/fs.js"
+
+# `constants/itemsMap.js` reads __dirname at module scope to find the items backup file
+# it writes next to itself. There is no such identifier in a bundled ES module, so the
+# reference alone throws a ReferenceError the moment the package is imported - the fs
+# alias above never gets a chance to say the file is missing. Substituting a path is
+# enough: shims/fs.js answers "no such file" whatever the path says. Nothing else in the
+# bundle mentions __dirname, which is what makes a global substitution safe here.
+[define]
+__dirname = "\"/\""
+
 # The ranked rows, one per player UUID. Create it once with:
 #   wrangler kv namespace create LEADERBOARD
 # then paste the id it prints in below.
@@ -36,6 +58,11 @@ new_sqlite_classes = ["PartyRoom"]
 #                 mod sends, so it can be added at any point with no redeploy of the mod.
 #                 Must never be shipped inside the mod: a key in a distributed jar is a
 #                 published key, and the API terms do not allow it.
+#
+#   SKYHELPER_URL an escape hatch, and normally unset: networth is calculated on this
+#                 Worker. Point it at a hosted or self-hosted SkyHelper instance and
+#                 every !nw is forwarded there instead, which is the way out if an
+#                 upstream change ever outgrows the shims in shims/.
 #
 #   ADMIN_SECRET  guards /lb/probe, which dumps the shape of a profile response so the
 #                 dragon field paths can be read off a real payload rather than guessed.

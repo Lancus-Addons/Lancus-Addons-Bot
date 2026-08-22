@@ -92,7 +92,7 @@ export class PartyRoom {
     switch (url.pathname) {
       case '/pf/list': {
         const parties = Object.values(this.parties).map((p) => ({
-          id: p.id, host: p.host, uuid: p.uuid,
+          id: p.id, host: p.host, uuid: p.uuid, kind: p.kind || 'dragon',
           eyes: p.eyes, dragons: p.dragons,
           lobbySwap: p.lobbySwap, note: p.note,
           size: p.size, maxSize: p.maxSize, members: p.members || [],
@@ -112,14 +112,21 @@ export class PartyRoom {
         }
         // One listing per host. Re-posting replaces rather than duplicates, so a
         // client that crashed and came back does not leave a ghost beside itself.
+        const kind = body.kind === 'fishing' ? 'fishing' : 'dragon';
         for (const [id, p] of Object.entries(this.parties)) {
-          if (p.host.toLowerCase() === host.toLowerCase()) delete this.parties[id];
+          if (p.host.toLowerCase() === host.toLowerCase() && (p.kind || 'dragon') === kind) {
+            delete this.parties[id];
+          }
         }
         const id = crypto.randomUUID().slice(0, 8);
         const token = crypto.randomUUID();
         this.parties[id] = {
           id, token, host, uuid,
-          eyes: clampInt(body.eyes, 0, 8),
+          // Fishing and dragon parties share this list, and nothing but the kind keeps
+          // them apart. Unknown kinds fall back to dragon so an older client is visible
+          // somewhere rather than nowhere.
+          kind: body.kind === 'fishing' ? 'fishing' : 'dragon',
+          eyes: clampInt(body.eyes, 0, 50),
           dragons: clampInt(body.dragons, 0, 10000),
           lobbySwap: !!body.lobbySwap,
           note: cleanNote(body.note),
@@ -416,22 +423,67 @@ async function top(env, limit, uuid) {
 const MOJANG_TTL_MS  = 24 * 60 * 60 * 1000;
 const PROFILE_TTL_MS = 2 * 60 * 1000;
 
-/** Name to UUID, cached hard because names change rarely and Mojang rate-limits. */
-async function resolveUuid(env, name) {
-  const clean = cleanName(name);
-  if (!clean) return null;
+/** 32 hex characters, dashes optional, which is what the Hypixel API wants. */
+function asUuid(raw) {
+  const flat = String(raw || '').trim().toLowerCase().replace(/-/g, '');
+  return /^[0-9a-f]{32}$/.test(flat) ? flat : null;
+}
+
+/**
+ * Name or UUID to UUID.
+ *
+ * Two things were wrong here and they hid each other. A UUID went through `cleanName`,
+ * which strips dashes and then truncates to 16 characters, so it arrived as half a UUID
+ * and matched nobody - which is why passing one directly did not help. And a Mojang
+ * lookup that fails for any reason returned null, which the caller reported as "no such
+ * player", so a rate-limited request and a genuinely unknown name produced the same
+ * sentence. Mojang rate-limits by IP, and a Worker shares its egress with a great many
+ * other people, so that failure is the likely one rather than the exotic one.
+ *
+ * So: a UUID is accepted as-is and never looked up, and a name that cannot be resolved
+ * says which of the two happened.
+ */
+async function resolveUuid(env, input) {
+  const direct = asUuid(input);
+  if (direct) return { uuid: direct, name: '', at: Date.now() };
+
+  const clean = cleanName(input);
+  if (!clean) return { error: 'no name given' };
+
   const key = 'u:' + clean.toLowerCase();
   const hit = await env.LEADERBOARD.get(key, 'json');
-  if (hit && Date.now() - hit.at < MOJANG_TTL_MS) return hit;
+  if (hit && hit.uuid && Date.now() - hit.at < MOJANG_TTL_MS) return hit;
 
-  const res = await fetch('https://api.mojang.com/users/profiles/minecraft/'
-    + encodeURIComponent(clean));
-  if (!res.ok) return null;
-  const data = await res.json().catch(() => null);
-  if (!data || !data.id) return null;
-  const row = { uuid: data.id, name: data.name, at: Date.now() };
-  await env.LEADERBOARD.put(key, JSON.stringify(row), { expirationTtl: 86400 });
-  return row;
+  // Mojang first, then a mirror. The mirror exists because Mojang answers a Worker far
+  // less reliably than it answers a laptop, and a name lookup failing is not a reason to
+  // refuse to answer a question about somebody who plainly exists.
+  const sources = [
+    { url: 'https://api.mojang.com/users/profiles/minecraft/' + encodeURIComponent(clean),
+      read: (d) => (d && d.id ? { uuid: d.id, name: d.name } : null) },
+    { url: 'https://playerdb.co/api/player/minecraft/' + encodeURIComponent(clean),
+      read: (d) => (d && d.data && d.data.player
+        ? { uuid: String(d.data.player.raw_id || '').replace(/-/g, ''),
+            name: d.data.player.username }
+        : null) },
+  ];
+
+  let sawAnswer = false;
+  for (const src of sources) {
+    try {
+      const res = await fetch(src.url, { headers: { 'user-agent': 'LancusAddons' } });
+      // A 204 or 404 from Mojang is a real answer: that name does not exist.
+      if (res.status === 204 || res.status === 404) { sawAnswer = true; continue; }
+      if (!res.ok) continue;
+      const parsed = src.read(await res.json().catch(() => null));
+      if (!parsed || !asUuid(parsed.uuid)) { sawAnswer = true; continue; }
+      const row = { uuid: asUuid(parsed.uuid), name: parsed.name || clean, at: Date.now() };
+      await env.LEADERBOARD.put(key, JSON.stringify(row), { expirationTtl: 86400 });
+      return row;
+    } catch (e) {
+      // Try the next source rather than giving up on the first network hiccup.
+    }
+  }
+  return { error: sawAnswer ? 'no such player' : 'could not reach the name lookup' };
 }
 
 /**
@@ -527,33 +579,40 @@ function bestiaryOf(profiles, uuid, query) {
   }
   if (!sawBestiary) return { error: 'bestiary API is off' };
 
-  // Exact key first, then a key containing the query, then the query containing the key.
-  // Ties go to the biggest count, which is the tier the player has actually farmed.
-  let best = null;
-  for (const [k, v] of totals.entries()) {
-    const flat = k.toLowerCase().replace(/[^a-z0-9]/g, '');
-    const score = flat === want ? 3 : flat.includes(want) ? 2 : want.includes(flat) ? 1 : 0;
-    if (score === 0) continue;
-    if (!best || score > best.score || (score === best.score && v > best.kills)) {
-      best = { key: k, kills: v, score };
-    }
-  }
-  if (!best) return { error: 'no mob matching that' };
+  // Match on whole words, not substrings. A substring match made "dragon" find
+  // DRAGONFLY, which is a different animal in every sense, and whichever of the two had
+  // more kills won - so the answer depended on how the player had been spending their
+  // time. Keys are underscore-separated (ENDER_DRAGON_YOUNG, DRAGONFLY_1), so splitting
+  // on the separators and comparing whole tokens is both stricter and simpler.
+  const tokensOf = (key) => key.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
 
-  // Every tier of the same mob is its own key, so they are added up: somebody asking how
-  // many zealots you have killed does not mean zealots of one particular tier.
-  let sum = 0;
-  const flatWant = best.key.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const matched = [];
   for (const [k, v] of totals.entries()) {
-    const flat = k.toLowerCase().replace(/[^a-z0-9]/g, '');
-    if (flat === flatWant || flat.includes(want)) sum += v;
+    const tokens = tokensOf(k);
+    const flat = tokens.join('');
+    if (flat === want || tokens.includes(want)) matched.push([k, v]);
   }
-  return { kills: sum, matched: best.key };
+
+  if (matched.length === 0) {
+    // Nothing matched a whole word. Rather than fall back to substrings and reintroduce
+    // the dragonfly problem, say so and let the asker be more specific.
+    return { error: 'no mob matching that' };
+  }
+
+  // Every tier and variant is its own key, so they are added up: somebody asking how many
+  // dragons you have killed means all of them, not one type.
+  const kills = matched.reduce((a, [, v]) => a + v, 0);
+  matched.sort((a, b) => b[1] - a[1]);
+  return {
+    kills,
+    matched: matched[0][0],
+    variants: matched.length,
+  };
 }
 
 async function playerSummary(env, name) {
   const who = await resolveUuid(env, name);
-  if (!who) return json({ error: 'no such player' }, 404);
+  if (who.error) return json({ name, error: who.error }, 200);
 
   const cacheKey = 'pl:' + who.uuid;
   const cached = await env.LEADERBOARD.get(cacheKey, 'json');
@@ -567,7 +626,7 @@ async function playerSummary(env, name) {
   const money = moneyOf(profile, member);
 
   const out = {
-    name: who.name,
+    name: who.name || name,
     uuid: who.uuid,
     profile: profile.cute_name || '',
     ...money,
@@ -579,19 +638,38 @@ async function playerSummary(env, name) {
 }
 
 /**
- * Networth, delegated to a SkyHelper instance.
+ * Networth, computed on the Worker.
  *
- * Not computed here, and the reason is worth writing down because the obvious guesses are
- * both wrong. It is not zlib - Buffer, Stream and Zlib are all supported under
- * `nodejs_compat`, and the library bundles to 172 KiB. It is that networth means parsing
- * item NBT, prismarine-nbt gets its parser from protodef, and protodef builds that parser
- * by calling `eval()` at module scope. Workers forbids code generation from strings and
- * there is no flag to permit it, so this is a platform limit rather than a gap: short of
- * forking prismarine-nbt onto its interpreted path, the calculation has to run somewhere
- * that allows eval.
+ * It could not be, and the reason is worth keeping because two wrong answers were given
+ * before the right one. Not zlib - Buffer, Stream and Zlib all work under
+ * `nodejs_compat`, and the library bundles to 172 KiB. Not size either. It is that
+ * networth means parsing item NBT, `skyhelper-networth` reads NBT through
+ * prismarine-nbt, prismarine-nbt gets its parser from protodef, and protodef builds that
+ * parser by calling `eval()` at module scope - so importing the package is enough to
+ * throw on a platform that refuses code generation from strings and offers no flag to
+ * allow it.
  *
- * SKYHELPER_URL points at that somewhere - a hosted instance, or a self-hosted one, or a
- * Cloudflare Container, which is the only Cloudflare product that can run it.
+ * The way through is to not use that parser. `alias` in wrangler.partyfinder.toml points
+ * `prismarine-nbt` at shims/prismarine-nbt.js, which reads the same NBT with NBTify, a
+ * parser that walks the bytes through a DataView and never eval()s anything. Two other
+ * aliases go with it and are described in their own files: axios, and the filesystem
+ * that `constants/itemsMap.js` writes its items backup to.
+ *
+ * The import below is dynamic, and has to stay that way. skyhelper-networth's manager
+ * singletons call `setInterval` and start fetching the Hypixel items list from their
+ * constructors, at module scope, and Workers reject both outside a request
+ * ("Disallowed operation called within global scope"). A static import runs that code
+ * while the isolate is starting; a dynamic one runs it inside the request that first
+ * asks for a networth, where it is ordinary work.
+ *
+ * That first request pays for it: the items list and the SkyHelper price list are a few
+ * megabytes between them and are fetched and parsed before any figure comes out. Both
+ * are then cached in module scope for the life of the isolate, so it is a cold-start
+ * cost rather than a per-lookup one, but it is why this route is slower than the others.
+ *
+ * SKYHELPER_URL still delegates to a hosted or self-hosted SkyHelper instance when it is
+ * set, as an escape hatch: an upstream change that this shim does not survive can be
+ * routed around from the dashboard, without waiting on a deploy.
  */
 /** One player's museum on one profile, or null when it is unavailable or switched off. */
 async function fetchMuseum(env, profileId, uuid) {
@@ -609,16 +687,59 @@ async function fetchMuseum(env, profileId, uuid) {
   }
 }
 
+/** The two figures, calculated here, or the reason there are none. */
+async function localNetworth(member, museum, bank) {
+  try {
+    // Dynamic on purpose - see the note above. `onlyNetworth` drops the per-item
+    // breakdown, which no caller shows and which is the expensive half to assemble.
+    const { ProfileNetworthCalculator } = await import('skyhelper-networth');
+    const result = await new ProfileNetworthCalculator(member, museum, bank)
+      .getNetworth({ onlyNetworth: true });
+
+    if (!Number.isFinite(result?.networth)) return { error: 'networth came out empty' };
+    return {
+      networth: result.networth,
+      unsoulbound: Number(result.unsoulboundNetworth) || result.networth,
+    };
+  } catch (e) {
+    // Logged as well as returned: chat gets a sentence a player can act on, and
+    // `wrangler tail` gets the thing that actually broke, which is usually upstream.
+    console.error('[networth] calculation failed:', e);
+    return { error: 'networth could not be calculated' };
+  }
+}
+
+/** The same two figures from a hosted SkyHelper instance, when SKYHELPER_URL is set. */
+async function delegatedNetworth(env, member, museum, bank) {
+  try {
+    const headers = { 'content-type': 'application/json' };
+    if (env.SKYHELPER_TOKEN) headers.Authorization = env.SKYHELPER_TOKEN;
+    const res = await fetch(env.SKYHELPER_URL.replace(/\/$/, '') + '/v2/networth', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ profileData: member, museumData: museum, bankBalance: bank }),
+    });
+    if (!res.ok) return { error: 'networth service returned ' + res.status };
+
+    const data = await res.json().catch(() => null);
+    const total = Number(data?.networth ?? data?.total ?? data?.data?.networth);
+    if (!Number.isFinite(total)) return { error: 'networth service gave no total' };
+    return { networth: total, unsoulbound: Number(data?.unsoulboundNetworth) || total };
+  } catch (e) {
+    return { error: 'networth service unreachable' };
+  }
+}
+
 async function networthOf(env, name) {
   const who = await resolveUuid(env, name);
-  if (!who) return json({ error: 'no such player' }, 404);
+  if (who.error) return json({ name, error: who.error }, 200);
 
   const got = await fetchProfiles(env, who.uuid);
-  if (got.error) return json({ name: who.name, error: got.error }, 200);
+  if (got.error) return json({ name: who.name || name, error: got.error }, 200);
 
   const profile = selectedProfile(got.profiles);
   const member = memberOf(profile, who.uuid);
-  if (!member) return json({ name: who.name, error: 'no profile data' }, 200);
+  if (!member) return json({ name: who.name || name, error: 'no profile data' }, 200);
 
   // Absent rather than zero when banking is switched off, so a hidden bank is not
   // quietly counted as an empty one.
@@ -629,37 +750,19 @@ async function networthOf(env, name) {
   // figure, just one that omits it.
   const museum = await fetchMuseum(env, profile.profile_id, who.uuid);
 
-  if (!env.SKYHELPER_URL) {
-    return json({ name: who.name, error: 'networth is not set up on the worker' }, 200);
-  }
+  const figures = env.SKYHELPER_URL
+    ? await delegatedNetworth(env, member, museum, bank)
+    : await localNetworth(member, museum, bank);
+  if (figures.error) return json({ name: who.name || name, error: figures.error }, 200);
 
-  try {
-    const headers = { 'content-type': 'application/json' };
-    if (env.SKYHELPER_TOKEN) headers.Authorization = env.SKYHELPER_TOKEN;
-    const res = await fetch(env.SKYHELPER_URL.replace(/\/$/, '') + '/v2/networth', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ profileData: member, museumData: museum, bankBalance: bank }),
-    });
-    if (!res.ok) {
-      return json({ name: who.name, error: 'networth service returned ' + res.status }, 200);
-    }
-    const data = await res.json().catch(() => null);
-    const total = Number(data?.networth ?? data?.total ?? data?.data?.networth);
-    if (!Number.isFinite(total)) {
-      return json({ name: who.name, error: 'networth service gave no total' }, 200);
-    }
-    return json({
-      name: who.name,
-      networth: Math.round(total),
-      unsoulbound: Math.round(Number(data?.unsoulboundNetworth) || total),
-      profile: profile.cute_name || '',
-      bankHidden: !profile.banking,
-      museumCounted: museum !== null,
-    });
-  } catch (e) {
-    return json({ name: who.name, error: 'networth service unreachable' }, 200);
-  }
+  return json({
+    name: who.name,
+    networth: Math.round(figures.networth),
+    unsoulbound: Math.round(figures.unsoulbound),
+    profile: profile.cute_name || '',
+    bankHidden: !profile.banking,
+    museumCounted: museum !== null,
+  });
 }
 
 export default {
@@ -746,12 +849,13 @@ export default {
     }
 
     if (url.pathname === '/player/bestiary') {
-      const who = await resolveUuid(env, url.searchParams.get('name') || '');
-      if (!who) return json({ error: 'no such player' }, 404);
+      const asked = url.searchParams.get('name') || '';
+      const who = await resolveUuid(env, asked);
+      if (who.error) return json({ name: asked, error: who.error }, 200);
       const got = await fetchProfiles(env, who.uuid);
       if (got.error) return json({ name: who.name, error: got.error }, 200);
       const res = bestiaryOf(got.profiles, who.uuid, url.searchParams.get('mob') || '');
-      return json({ name: who.name, ...res });
+      return json({ name: who.name || asked, ...res });
     }
 
     if (url.pathname === '/player/networth') {

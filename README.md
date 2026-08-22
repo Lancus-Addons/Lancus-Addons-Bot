@@ -86,10 +86,46 @@ whoever added it.
 `/check` exists so joining a full party is one request rather than one per person.
 Neither route includes the reporter.
 
+## Networth runs on the Worker
+
+`!nw` in the mod calls `/player/networth` on the party finder Worker, and the figure is
+calculated there rather than fetched from somewhere else. That takes three swaps, all
+set up in `wrangler.partyfinder.toml` and all needed because `skyhelper-networth` was
+written for Node:
+
+| Swapped | For | Because |
+| --- | --- | --- |
+| `prismarine-nbt` | `shims/prismarine-nbt.js` | it builds its NBT parser with `eval()`, which Workers forbid. The shim reads the same NBT with NBTify |
+| `axios` | `shims/axios.js` | it picks its transport by sniffing for Node, and a Worker under `nodejs_compat` is an ambiguous case. The shim is the two GETs the package makes, on `fetch` |
+| `fs` | `shims/fs.js` | the package caches the Hypixel items list to a file next to itself. There is nowhere to write, so the shim says the file is not there |
+
+Each shim explains itself at the top of its own file, and the NBT one is worth reading
+before changing anything near it: NBTify parses asynchronously and prismarine-nbt does
+not, which the shim bridges in a way that depends on the exact shape of
+`skyhelper-networth/helper/decode.js`. Both packages are therefore pinned to exact
+versions, and `npm test` is what tells you whether a bump still fits - it parses every
+tag type through both parsers and compares. Run it before deploying a bump:
+
+```sh
+cd lancus-bot
+npm install
+npm test
+```
+
+The first lookup after a Worker starts spends about a second fetching the Hypixel items
+list and the SkyHelper price list; both are then cached for the life of the isolate and
+later lookups take under 200 ms.
+
+`SKYHELPER_URL` is the escape hatch. Set it to a hosted or self-hosted SkyHelper instance
+and every lookup is forwarded there instead, which is a dashboard change rather than a
+deploy if an upstream release ever outgrows the shims.
+
 ## Setup
 
 Nothing here needs Node, npm or wrangler installed. Everything is done in the
-Cloudflare and Discord dashboards, plus one `curl` at the end.
+Cloudflare and Discord dashboards, plus one `curl` at the end. The Discord bot has
+no dependencies at all; the party finder's are installed by Cloudflare's build from
+`package-lock.json`, so Node is only needed locally to run `npm test`.
 
 ### 1. Discord application
 

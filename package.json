@@ -3,5 +3,15 @@
   "private": true,
   "type": "module",
   "description": "Party finder, dragon leaderboard and player lookups for Lancus Addons.",
-  "comment": "No dependencies. skyhelper-networth cannot run on Workers: prismarine-nbt builds its parser with eval() at module scope, which Workers forbids. See the networthOf comment in partyfinder.js."
+  "comment": "skyhelper-networth runs on the Worker itself. It cannot do so unmodified - prismarine-nbt builds its parser with eval() at module scope, which Workers forbid - so `alias` in wrangler.partyfinder.toml swaps it for shims/prismarine-nbt.js, which parses the same NBT with NBTify. Both dependencies are pinned exactly: the shim leans on the shape of skyhelper's helper/decode.js, and tests/nbt-shim.test.js is what says whether a bump still fits.",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {
+    "nbtify": "2.2.0",
+    "skyhelper-networth": "2.8.0"
+  },
+  "devDependencies": {
+    "prismarine-nbt": "2.8.0"
+  }
 }
